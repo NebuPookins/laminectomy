@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spine rig viewer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@esotericsoftware/spine-player@4.1.56/dist/spine-player.css">
+<style>
+  body { margin: 0; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+  header { padding: 12px 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  select { font-size: 14px; padding: 4px 8px; max-width: 70vw; }
+  #status { font-size: 13px; opacity: 0.7; }
+  #player { width: 100%; height: calc(100vh - 60px); }
+</style>
+</head>
+<body>
+<header>
+  <label for="rig">Rig:</label>
+  <select id="rig"></select>
+  <span id="status"></span>
+</header>
+<div id="player"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@esotericsoftware/spine-player@4.1.56/dist/iife/spine-player.js"></script>
+<script>
+  const select = document.getElementById("rig");
+  const status = document.getElementById("status");
+  const container = document.getElementById("player");
+
+  // rigs.json is generated from the extraction manifest; each entry points at one rig folder.
+  let RIGS = [];
+
+  function populate(rigs) {
+    const groups = new Map();
+    rigs.forEach((rig, i) => {
+      if (!groups.has(rig.group)) groups.set(rig.group, document.createElement("optgroup"));
+      groups.get(rig.group).label = rig.group;
+      const opt = document.createElement("option");
+      opt.value = String(i);
+      opt.textContent = rig.label;
+      groups.get(rig.group).appendChild(opt);
+    });
+    groups.forEach((g) => select.appendChild(g));
+  }
+
+  function load(index) {
+    const rig = RIGS[index];
+    container.innerHTML = "";
+    status.textContent = "loading " + rig.label + " ...";
+    const url = rig.dir + "/" + encodeURIComponent(rig.skel);
+    const atlas = rig.dir + "/" + encodeURIComponent(rig.atlas);
+    const skelOpts = rig.skel.endsWith(".json") ? { jsonUrl: url } : { skelUrl: url };
+    try {
+      new spine.SpinePlayer(container, {
+        ...skelOpts,
+        atlasUrl: atlas,
+        showControls: true,
+        viewport: { padLeft: "10%", padRight: "10%", padTop: "5%", padBottom: "5%" },
+        backgroundColor: "#00000000",
+        success: (player) => {
+          const names = player.skeleton.data.animations.map((a) => a.name);
+          status.textContent = names.length + " animations: " + names.join(", ");
+        },
+        error: (player, msg) => {
+          status.textContent = "failed to load " + rig.label + ": " + msg;
+        },
+      });
+    } catch (e) {
+      status.textContent = "failed to start player: " + e;
+    }
+  }
+
+  select.addEventListener("change", () => load(Number(select.value)));
+
+  fetch("rigs.json")
+    .then((r) => r.json())
+    .then((rigs) => {
+      RIGS = rigs;
+      populate(rigs);
+      status.textContent = rigs.length + " rigs";
+      const start = Math.max(0, rigs.findIndex((r) => r.skel === "Dialog_Goddess_Cut.json"));
+      select.value = String(start);
+      load(start);
+    })
+    .catch((e) => { status.textContent = "failed to load rigs.json: " + e; });
+</script>
+</body>
+</html>
