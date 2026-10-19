@@ -1,4 +1,4 @@
-"""Find Spine rigs in Unity data and write each one as a self-contained folder.
+"""Find Spine rigs in Unity data and return them as in-memory Rig values.
 
 Two input shapes are supported:
 
@@ -7,23 +7,26 @@ Two input shapes are supported:
 * Editor projects: raw ``.atlas`` files with their ``.json`` / ``.skel`` and PNG
   pages sitting beside them under ``Assets``.
 
-Every rig is written as ``<out>/rigs/<source>/<rig>/`` with the skeleton, its
-atlas, and premultiplied PNG pages.
+Nothing here touches the output folder. Failures are logged with their traceback
+and also returned in ``Extraction.errors``, so the caller can show them. They are
+never silently dropped.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 import UnityPy
 from PIL import Image
 
 from .atlas import page_names, prepare
-from .pixels import premultiply
+from .pixels import png_bytes, premultiply
+
+logger = logging.getLogger(__name__)
 
 _VERSION = re.compile(rb"[34]\.[018]\.\d")
 _BUNDLE_MAGICS = (b"UnityFS", b"UnityWe", b"UnityRa")
@@ -36,26 +39,81 @@ def safe(name: str) -> str:
 
 
 @dataclass(frozen=True)
-class RigEntry:
-    """One rig as listed in rigs.json. ``atlas`` is None when no atlas was found."""
+class Rig:
+    """One Spine rig, fully in memory.
 
+    ``key`` is the rig's folder path inside the viewer (``rigs/<source>/<name>``).
+    ``pages`` holds premultiplied PNG bytes. ``atlas_text`` is None when no atlas
+    was found, and such rigs are not shown in the viewer.
+    """
+
+    key: str
     group: str
     source: str
-    rig: str
-    dir: str
-    skel: str
-    atlas: str | None
+    name: str
+    skeleton_name: str
+    skeleton: bytes
+    atlas_name: str | None
+    atlas_text: str | None
+    pages: tuple[tuple[str, bytes], ...]
     missing_pages: tuple[str, ...]
 
-    def as_json(self) -> dict[str, Any]:
-        return {
-            "label": f"{self.source}  ·  {self.rig}",
-            "group": self.group,
-            "dir": self.dir,
-            "skel": self.skel,
-            "atlas": self.atlas,
-            "missing_pages": list(self.missing_pages),
-        }
+    @property
+    def viewable(self) -> bool:
+        return self.atlas_text is not None
+
+
+@dataclass(frozen=True)
+class Extraction:
+    """What one input file produced: its rigs, plus a message for every failure."""
+
+    rigs: tuple[Rig, ...]
+    errors: tuple[str, ...]
+
+
+def unique_key(key: str, taken: set[str]) -> str:
+    candidate = key
+    counter = 2
+    while candidate in taken:
+        candidate = f"{key}__{counter}"
+        counter += 1
+    taken.add(candidate)
+    return candidate
+
+
+def make_rig(
+    *,
+    key: str,
+    group: str,
+    source: str,
+    name: str,
+    kind: str,
+    skeleton: bytes,
+    atlas_text: str | None,
+    pages: Mapping[str, Image.Image],
+) -> Rig:
+    skeleton_name = f"{safe(name)}.{'json' if kind == 'json' else 'skel'}"
+    if atlas_text is None:
+        logger.info("rig %s (%s) has no atlas; it will not be viewable", key, source)
+        return Rig(key, group, source, name, skeleton_name, skeleton, None, None, (), ())
+    sizes = {page: image.size for page, image in pages.items()}
+    encoded = tuple((page, png_bytes(premultiply(image))) for page, image in pages.items())
+    missing = tuple(page for page in page_names(atlas_text) if page not in pages)
+    if missing:
+        logger.warning("rig %s (%s) is missing texture pages: %s", key, source, ", ".join(missing))
+    logger.debug("rig %s: %d pages, %d skeleton bytes", key, len(encoded), len(skeleton))
+    return Rig(
+        key=key,
+        group=group,
+        source=source,
+        name=name,
+        skeleton_name=skeleton_name,
+        skeleton=skeleton,
+        atlas_name=f"{safe(name)}.atlas",
+        atlas_text=prepare(atlas_text, sizes),
+        pages=encoded,
+        missing_pages=missing,
+    )
 
 
 # --- Unity built data --------------------------------------------------------
@@ -65,6 +123,7 @@ def is_unity_bundle(path: Path) -> bool:
         with path.open("rb") as handle:
             return handle.read(7) in _BUNDLE_MAGICS
     except OSError:
+        logger.warning("could not read %s to check whether it is a bundle", path, exc_info=True)
         return False
 
 
@@ -86,6 +145,7 @@ def find_game_sources(data_dir: Path) -> list[Path]:
         if streaming.is_dir()
         else []
     )
+    logger.info("found %d serialized files and %d bundles under %s", len(serialized), len(bundles), data_dir)
     return sorted(serialized) + sorted(bundles)
 
 
@@ -110,37 +170,41 @@ def _pick_atlas(base: str, atlases: Mapping[str, str]) -> str | None:
     return next((name for name in atlases if name.startswith(base)), None)
 
 
-def _unique_dir(parent: Path, base: str, taken: set[str]) -> Path:
-    name = safe(base)
-    counter = 2
-    while name in taken:
-        name = f"{safe(base)}__{counter}"
-        counter += 1
-    taken.add(name)
-    return parent / name
+def _unity_group(source: str) -> str:
+    parts = Path(source).parts
+    if parts and parts[0] == "StreamingAssets" and len(parts) > 1:
+        return parts[1]
+    return parts[0] if parts else source
 
 
-def extract_unity_file(job: tuple[Path, str, Path]) -> list[RigEntry]:
+def extract_unity_file(job: tuple[Path, str]) -> Extraction:
     """Pull every Spine rig out of one serialized file or bundle."""
-    path, source, out_rigs = job
+    path, source = job
+    logger.info("reading %s", source)
     try:
         env = UnityPy.load(str(path))
-    except Exception:
-        return []
+    except Exception as exc:
+        logger.exception("UnityPy could not open %s", source)
+        return Extraction((), (f"{source}: could not open the file ({exc!r})",))
 
+    errors: list[str] = []
     texts: list[tuple[str, bytes]] = []
-    textures_needed: set[str] = set()
     for obj in env.objects:
         if obj.type.name != "TextAsset":
             continue
         data = obj.read()
-        raw = data.m_Script.encode("utf-8", "surrogateescape") if isinstance(data.m_Script, str) else bytes(data.m_Script)
+        raw = (
+            data.m_Script.encode("utf-8", "surrogateescape")
+            if isinstance(data.m_Script, str)
+            else bytes(data.m_Script)
+        )
         texts.append((data.m_Name, raw))
 
     atlases = {
         name: raw.decode("utf-8", "surrogateescape") for name, raw in texts if name.endswith(".atlas")
     }
     skeletons: list[tuple[str, str, bytes, str | None]] = []
+    needed: set[str] = set()
     for name, raw in texts:
         if name.endswith(".atlas"):
             continue
@@ -151,59 +215,45 @@ def extract_unity_file(job: tuple[Path, str, Path]) -> list[RigEntry]:
         atlas_name = _pick_atlas(base, atlases)
         skeletons.append((base, kind, raw, atlas_name))
         if atlas_name:
-            textures_needed.update(page[:-4] for page in page_names(atlases[atlas_name]))
+            needed.update(page[:-4] for page in page_names(atlases[atlas_name]))
 
     images: dict[str, Image.Image] = {}
-    if textures_needed:
+    if needed:
         for obj in env.objects:
             if obj.type.name != "Texture2D":
                 continue
             data = obj.read()
-            if data.m_Name not in textures_needed or data.m_Name in images:
+            if data.m_Name not in needed or data.m_Name in images:
                 continue
             try:
                 images[data.m_Name] = data.image
-            except Exception:
-                continue
+            except Exception as exc:
+                logger.exception("could not decode texture %r in %s", data.m_Name, source)
+                errors.append(f"{source}: texture {data.m_Name!r} could not be decoded ({exc!r})")
 
-    out_root = out_rigs.parent
-    source_dir = out_rigs / safe(source)
     taken: set[str] = set()
-    entries: list[RigEntry] = []
+    rigs: list[Rig] = []
     for base, kind, raw, atlas_name in skeletons:
-        dest = _unique_dir(source_dir, base, taken)
-        entries.append(
-            _write_rig(
-                dest=dest,
-                out_root=out_root,
+        atlas_text = atlases[atlas_name] if atlas_name else None
+        page_images = {
+            page: images[page[:-4]]
+            for page in (page_names(atlas_text) if atlas_text else ())
+            if page[:-4] in images
+        }
+        rigs.append(
+            make_rig(
+                key=unique_key(f"rigs/{safe(source)}/{safe(base)}", taken),
                 group=_unity_group(source),
                 source=source,
-                base=base,
+                name=base,
                 kind=kind,
                 skeleton=raw,
-                atlas_text=atlases.get(atlas_name) if atlas_name else None,
-                pages={name: images[name[:-4]] for name in _atlas_pages(atlases, atlas_name) if name[:-4] in images},
+                atlas_text=atlas_text,
+                pages=page_images,
             )
         )
-    return entries
-
-
-def _atlas_pages(atlases: Mapping[str, str], atlas_name: str | None) -> tuple[str, ...]:
-    return page_names(atlases[atlas_name]) if atlas_name else ()
-
-
-def _unity_group(source: str) -> str:
-    parts = Path(source).parts
-    if parts and parts[0] == "StreamingAssets" and len(parts) > 1:
-        return parts[1]
-    return parts[0] if parts else source
-
-
-def _project_group(source: str) -> str:
-    parts = Path(source).parts
-    if parts and parts[0] == "Assets" and len(parts) > 1:
-        return parts[1]
-    return parts[0] if parts else source
+    logger.info("%s: %d rigs, %d errors", source, len(rigs), len(errors))
+    return Extraction(tuple(rigs), tuple(errors))
 
 
 # --- Editor projects ---------------------------------------------------------
@@ -216,71 +266,46 @@ def find_project_atlases(project: Path) -> list[Path]:
     )
 
 
-def extract_project_atlas(job: tuple[Path, Path, Path]) -> list[RigEntry]:
-    """Copy one raw Spine rig (atlas, skeleton and PNG pages) out of an editor project."""
-    atlas_path, project, out_rigs = job
-    text = atlas_path.read_text(encoding="utf-8", errors="surrogateescape")
-    skeleton_path = next(
-        (p for p in (atlas_path.with_suffix(".json"), atlas_path.with_suffix(".skel")) if p.is_file()),
-        None,
-    )
-    if skeleton_path is None:
-        return []
-    kind = "json" if skeleton_path.suffix == ".json" else "skel"
-    source = str(atlas_path.relative_to(project).parent / atlas_path.stem)
-    pages: dict[str, Image.Image] = {}
-    for name in page_names(text):
-        page_file = atlas_path.parent / name
-        if page_file.is_file():
-            pages[name] = Image.open(page_file)
-    dest = out_rigs / safe(str(atlas_path.relative_to(project).parent)) / safe(atlas_path.stem)
-    entry = _write_rig(
-        dest=dest,
-        out_root=out_rigs.parent,
-        group=_project_group(source),
-        source=source,
-        base=atlas_path.stem,
-        kind=kind,
-        skeleton=skeleton_path.read_bytes(),
-        atlas_text=text,
-        pages=pages,
-    )
-    return [entry]
+def _project_group(source: str) -> str:
+    parts = Path(source).parts
+    if parts and parts[0] == "Assets" and len(parts) > 1:
+        return parts[1]
+    return parts[0] if parts else source
 
 
-# --- Shared writer -----------------------------------------------------------
-
-def _write_rig(
-    *,
-    dest: Path,
-    out_root: Path,
-    group: str,
-    source: str,
-    base: str,
-    kind: str,
-    skeleton: bytes,
-    atlas_text: str | None,
-    pages: Mapping[str, Image.Image],
-) -> RigEntry:
-    dest.mkdir(parents=True, exist_ok=True)
-    ext = "json" if kind == "json" else "skel"
-    skel_name = f"{safe(base)}.{ext}"
-    (dest / skel_name).write_bytes(skeleton)
-    atlas_name: str | None = None
-    missing: tuple[str, ...] = ()
-    if atlas_text is not None:
-        sizes = {name: image.size for name, image in pages.items()}
-        (dest / f"{safe(base)}.atlas").write_text(prepare(atlas_text, sizes), encoding="utf-8")
-        atlas_name = f"{safe(base)}.atlas"
-        for name, image in pages.items():
-            premultiply(image).save(dest / name)
-        missing = tuple(name for name in page_names(atlas_text) if name not in pages)
-    return RigEntry(
-        group=group,
-        source=source,
-        rig=base,
-        dir=dest.relative_to(out_root).as_posix(),
-        skel=skel_name,
-        atlas=atlas_name,
-        missing_pages=missing,
-    )
+def extract_project_atlas(job: tuple[Path, Path]) -> Extraction:
+    """Read one raw Spine rig (atlas, skeleton and PNG pages) from an editor project."""
+    atlas_path, project = job
+    relative = atlas_path.relative_to(project)
+    source = relative.with_suffix("").as_posix()
+    logger.info("reading %s", source)
+    try:
+        text = atlas_path.read_text(encoding="utf-8", errors="surrogateescape")
+        skeleton_path = next(
+            (p for p in (atlas_path.with_suffix(".json"), atlas_path.with_suffix(".skel")) if p.is_file()),
+            None,
+        )
+        if skeleton_path is None:
+            logger.warning("%s has no .json or .skel beside it; skipped", source)
+            return Extraction((), (f"{source}: no skeleton (.json or .skel) beside the atlas",))
+        pages: dict[str, Image.Image] = {}
+        for name in page_names(text):
+            page_file = atlas_path.parent / name
+            if page_file.is_file():
+                pages[name] = Image.open(page_file)
+            else:
+                logger.warning("%s: texture page %s not found", source, name)
+        rig = make_rig(
+            key=f"rigs/{safe(relative.parent.as_posix())}/{safe(atlas_path.stem)}",
+            group=_project_group(source),
+            source=source,
+            name=atlas_path.stem,
+            kind="json" if skeleton_path.suffix == ".json" else "skel",
+            skeleton=skeleton_path.read_bytes(),
+            atlas_text=text,
+            pages=pages,
+        )
+        return Extraction((rig,), ())
+    except Exception as exc:
+        logger.exception("could not read project rig %s", source)
+        return Extraction((), (f"{source}: could not be read ({exc!r})",))

@@ -1,15 +1,14 @@
 # laminectomy
 
-Find Spine rigs in a Unity project or a built Unity game, extract them, and
-browse them in a local web viewer.
+Find Spine rigs in a Unity project or a built Unity game, and browse them.
 
 - **Editor projects**: raw `.atlas` files with their `.json` / `.skel` and PNG
-  pages next to them under `Assets/` are copied out.
-- **Built games**: Spine data is pulled out of `*.assets`, `level*` files and
+  pages next to them under `Assets/`.
+- **Built games**: Spine data pulled out of `*.assets`, `level*` files and
   AssetBundles under `StreamingAssets/`, with their textures.
 
-Each rig gets a folder with its skeleton, a fixed atlas and premultiplied PNG
-pages, which spine-player can display directly.
+Each rig is shown with its skeleton, a fixed atlas and premultiplied PNG pages,
+played by spine-player.
 
 ## Install
 
@@ -18,23 +17,38 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
-## Use
+## Use the window
 
 ```sh
-# Build the viewer folder from a game (the folder that contains *_Data) or a project (contains Assets/)
-.venv/bin/laminectomy build /path/to/game -o ./out
-
-# Serve an existing viewer folder on http://127.0.0.1:8765/
-.venv/bin/laminectomy serve ./out
-
-# Build if needed, then serve
-.venv/bin/laminectomy run /path/to/game -o ./out
-.venv/bin/laminectomy run /path/to/game -o ./out --rebuild   # force a rebuild
+.venv/bin/laminectomy                       # opens the window; click "Choose game folder…"
+.venv/bin/laminectomy /path/to/game         # opens the window and loads that folder straight away
 ```
 
-Then open the URL it prints and choose a rig from the dropdown.
+Pick the folder that contains the game's `*_Data` directory, or a Unity project's
+folder (the one with `Assets/`). Extraction runs in memory. Nothing is written to
+disk, and the rigs appear in the embedded viewer as soon as they are ready.
 
-## What the output contains
+## Use the command line
+
+```sh
+# Write a viewer folder to disk, without opening the window
+.venv/bin/laminectomy build /path/to/game -o ./out
+
+# Serve a viewer folder written by build, on http://127.0.0.1:8765/
+.venv/bin/laminectomy serve ./out
+```
+
+## Logging
+
+Everything the app does is logged to stderr, including the full traceback for
+any failure. Failed files are listed in the log and in the window, and the rest
+of the folder still loads. For more detail, run with:
+
+```sh
+LAMINECTOMY_LOG=DEBUG .venv/bin/laminectomy /path/to/game
+```
+
+## What the viewer folder contains
 
 ```
 out/
@@ -53,8 +67,7 @@ out/
   the real page size, including `bounds`, `offsets`, `orig`, and the older
   `xy` / `size` / `offset` fields, and it marks pages premultiplied. This is
   what stops trimmed pieces (such as faces) from drifting out of place.
-- Skeletons with no matching atlas are skipped. The build summary reports how
-  many.
+- Skeletons with no matching atlas are skipped and counted.
 - The viewer needs internet access to load spine-player from the CDN.
 - Spine data here is 4.1.x. The viewer pins spine-player 4.1.56 to match.
 
