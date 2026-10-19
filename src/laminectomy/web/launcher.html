@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Laminectomy</title>
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; background: #111; color: #eee; }
+  body { display: flex; flex-direction: column; }
+  header { padding: 10px 14px; background: #1b1b1b; display: flex; flex-direction: column; gap: 6px; }
+  .row { display: flex; gap: 12px; align-items: center; }
+  button { font-size: 14px; padding: 5px 12px; }
+  #path { font-size: 13px; opacity: 0.8; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  #status { font-size: 13px; opacity: 0.85; }
+  #status.error { color: #f88; opacity: 1; }
+  #bar { display: none; height: 6px; background: #333; }
+  #fill { height: 100%; width: 0; background: #7cc; }
+  #viewer { flex: 1; border: 0; width: 100%; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <div class="row">
+    <button id="choose">Choose game folder…</button>
+    <span id="path">No folder selected</span>
+  </div>
+  <div id="status">Choose a built game's folder (the one containing *_Data), or a Unity project's folder.</div>
+  <div id="bar"><div id="fill"></div></div>
+</header>
+<iframe id="viewer" title="Rig viewer"></iframe>
+<script>
+  const chooseButton = document.getElementById("choose");
+  const pathLabel = document.getElementById("path");
+  const status = document.getElementById("status");
+  const bar = document.getElementById("bar");
+  const fill = document.getElementById("fill");
+  const viewer = document.getElementById("viewer");
+
+  // Called by the Python side. Keep these names in step with gui.py.
+  function onStart(path) {
+    pathLabel.textContent = path;
+    chooseButton.disabled = true;
+    status.classList.remove("error");
+    status.textContent = "Reading game data…";
+    bar.style.display = "block";
+    fill.style.width = "0";
+  }
+
+  function onProgress(done, total) {
+    fill.style.width = (100 * done / total) + "%";
+    status.textContent = "Extracting: " + done + " of " + total + " data files";
+  }
+
+  function onLoaded(count, errorCount) {
+    chooseButton.disabled = false;
+    bar.style.display = "none";
+    viewer.style.display = "block";
+    // A new query string forces the iframe to fetch the freshly built viewer.
+    viewer.src = "viewer/index.html?run=" + Date.now();
+    if (count === 0) {
+      status.textContent = "No Spine rigs were found in this folder. Check that it is the game's *_Data folder or a Unity project.";
+      status.classList.add("error");
+    } else if (errorCount > 0) {
+      status.textContent = count + " rigs loaded, but " + errorCount + " files had errors. See the log for details.";
+      status.classList.add("error");
+    } else {
+      status.textContent = count + " rigs loaded. Nothing was written to disk.";
+    }
+  }
+
+  function onError(message) {
+    chooseButton.disabled = false;
+    bar.style.display = "none";
+    status.textContent = message;
+    status.classList.add("error");
+  }
+
+  // Python shows the chosen folder and the progress through onStart and onProgress.
+  chooseButton.addEventListener("click", () => window.pywebview.api.choose_folder());
+</script>
+</body>
+</html>

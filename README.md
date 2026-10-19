@@ -17,7 +17,15 @@ python3 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 ```
 
+On Linux, building from source also needs the PyGObject build dependencies
+(`libgirepository1.0-dev libcairo2-dev pkg-config` on Debian/Ubuntu).
+
 ## Use the window
+
+The window uses the operating system's web view: WebView2 on Windows, WebKit on
+macOS, and WebKitGTK on Linux. On Linux, install WebKitGTK first (GTK3 comes with it):
+`webkit2gtk-4.1` (Arch), `gir1.2-webkit2-4.1` (Debian/Ubuntu), `webkit2gtk4.1` (Fedora).
+The Linux executable does not bundle GTK or WebKit. Without them, use the command line below.
 
 ```sh
 .venv/bin/laminectomy                       # opens the window; click "Choose game folder…"

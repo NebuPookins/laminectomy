@@ -56,6 +56,11 @@ class ViewerServer:
     _server: _Server
     _thread: threading.Thread
 
+    def replace_files(self, files: Mapping[str, bytes]) -> None:
+        """Swap in a new file set. Requests already in flight finish with the old one."""
+        self._server.files = files
+        logger.info("viewer now serves %d files", len(files))
+
     def stop(self) -> None:
         self._server.shutdown()
         self._server.server_close()

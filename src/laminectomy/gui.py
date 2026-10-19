@@ -1,32 +1,25 @@
 """Desktop window: pick a game or project folder, extract it in memory, and view the rigs.
 
-Extraction runs on a worker thread, so the window stays responsive. The result
-is served from memory on 127.0.0.1 and shown in an embedded web view, so
-nothing is written to disk.
+The window is a pywebview window that shows launcher.html. That page has the folder
+picker and the progress bar, and shows the viewer in an iframe. Both pages are served
+from a local in-memory server, so nothing is written to disk.
+
+Python calls into the page with ``evaluate_js``; the page calls Python through
+``window.pywebview.api``. The page's function names are listed in launcher.html.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
+import threading
+from importlib.resources import files
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QThread, QUrl, Signal
-from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import (
-    QApplication,
-    QFileDialog,
-    QHBoxLayout,
-    QLabel,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
+import webview
+from webview.errors import WebViewException
 
 from .build import detect_source, load_source, viewer_files, viewer_html
 from .logs import configure_logging
@@ -35,156 +28,92 @@ from .memory_server import ViewerServer, start_viewer
 logger = logging.getLogger(__name__)
 
 
-class _Loader(QThread):
-    progress = Signal(int, int)
-    loaded = Signal(object)  # {"files": dict[str, bytes], "count": int, "errors": tuple[str, ...]}
-    failed = Signal(str)
-
-    def __init__(self, path: Path) -> None:
-        super().__init__()
-        self._path = path
-
-    def run(self) -> None:
-        try:
-            source = detect_source(self._path)
-            result = load_source(source, progress=self.progress.emit)
-            files = viewer_files(result.rigs, viewer_html())
-            listing = json.loads(files["rigs.json"])
-            self.loaded.emit({"files": files, "count": len(listing), "errors": result.errors})
-        except Exception as exc:
-            logger.exception("could not load %s", self._path)
-            self.failed.emit(f"{exc}\n\nDetails are in the log (run with LAMINECTOMY_LOG=DEBUG for more).")
+_LINUX_BACKEND_HELP = """\
+Laminectomy could not open its window: no GUI backend was found.
+The desktop window needs WebKitGTK. Install it with your package manager:
+  Arch:           webkit2gtk-4.1
+  Debian/Ubuntu:  gir1.2-webkit2-4.1
+  Fedora:         webkit2gtk4.1
+Or skip the window: run `laminectomy build FOLDER -o OUT`, then `laminectomy serve OUT`."""
 
 
-class MainWindow(QMainWindow):
-    def __init__(self, initial: Path | None = None) -> None:
-        super().__init__()
-        self.setWindowTitle("Laminectomy")
-        self.resize(1200, 820)
-        self._viewer: ViewerServer | None = None
-        self._loader: _Loader | None = None
+def _launcher_html() -> bytes:
+    return (files("laminectomy") / "web" / "launcher.html").read_bytes()
 
-        self._choose = QPushButton("Choose game folder…")
-        self._path_label = QLabel("No folder selected")
-        self._progress = QProgressBar()
-        self._progress.setVisible(False)
-        self._status = QLabel(
-            "Choose a built game's folder (the one containing *_Data), or a Unity project's folder."
-        )
-        self._web = QWebEngineView()
-        self._web.setVisible(False)
 
-        top = QHBoxLayout()
-        top.addWidget(self._choose)
-        top.addWidget(self._path_label, 1)
+class Launcher:
+    """The object the page sees as ``window.pywebview.api``."""
 
-        layout = QVBoxLayout()
-        layout.addLayout(top)
-        layout.addWidget(self._progress)
-        layout.addWidget(self._status)
-        layout.addWidget(self._web, 1)
+    def __init__(self, server: ViewerServer, launcher_html: bytes) -> None:
+        self._server = server
+        self._launcher_files: dict[str, bytes] = {"index.html": launcher_html}
+        self._window: Any = None
+        self._busy = threading.Lock()
 
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+    def attach(self, window: Any) -> None:
+        self._window = window
 
-        self._choose.clicked.connect(self._pick_folder)
-        if initial is not None:
-            self._open(initial)
+    # --- called from the page -----------------------------------------------
 
-    # --- actions -----------------------------------------------------------
+    def choose_folder(self) -> str | None:
+        chosen = self._window.create_file_dialog(webview.FileDialog.FOLDER)
+        if not chosen:
+            logger.info("folder selection cancelled")
+            return None
+        logger.info("folder chosen: %s", chosen[0])
+        self.start_load(chosen[0])
+        return chosen[0]
 
-    def _pick_folder(self) -> None:
-        chosen = QFileDialog.getExistingDirectory(self, "Choose game folder")
-        if chosen:
-            self._open(Path(chosen))
+    # --- Python side ----------------------------------------------------------
 
-    def _open(self, path: Path) -> None:
-        if self._loader is not None and self._loader.isRunning():
+    def start_load(self, path: str) -> None:
+        if not self._busy.acquire(blocking=False):
+            logger.warning("ignored a request to load %s: a load is already running", path)
             return
-        self._path_label.setText(str(path))
-        self._choose.setEnabled(False)
-        self._progress.setRange(0, 0)  # busy until the first file reports
-        self._progress.setVisible(True)
-        self._status.setText("Reading game data…")
+        self._call("onStart", path)
+        threading.Thread(target=self._load, args=(path,), name="laminectomy-load", daemon=True).start()
 
-        self._loader = _Loader(path)
-        self._loader.progress.connect(self._on_progress)
-        self._loader.loaded.connect(self._on_loaded)
-        self._loader.failed.connect(self._on_failed)
-        self._loader.start()
+    def _load(self, path: str) -> None:
+        try:
+            source = detect_source(Path(path))
+            result = load_source(source, progress=lambda done, total: self._call("onProgress", done, total))
+            viewer = viewer_files(result.rigs, viewer_html())
+            listing = json.loads(viewer["rigs.json"])
+            served = {f"viewer/{name}": data for name, data in viewer.items()}
+            self._server.replace_files({**self._launcher_files, **served})
+            self._call("onLoaded", len(listing), len(result.errors))
+        except Exception as exc:
+            logger.exception("could not load %s", path)
+            self._call("onError", f"{exc}. Details are in the log.")
+        finally:
+            self._busy.release()
 
-    # --- loader callbacks (run on the GUI thread) --------------------------
-
-    def _on_progress(self, done: int, total: int) -> None:
-        self._progress.setRange(0, total)
-        self._progress.setValue(done)
-        self._status.setText(f"Extracting: {done} of {total} data files")
-
-    def _on_loaded(self, result: dict) -> None:
-        if self._viewer is not None:
-            self._viewer.stop()
-        self._viewer = start_viewer(result["files"])
-        self._web.load(QUrl(self._viewer.url))
-        self._web.setVisible(True)
-        self._finish_loading()
-        errors = result["errors"]
-        if result["count"] == 0:
-            logger.warning("no viewable Spine rigs found in %s", self._path_label.text())
-            self._status.setText(
-                "No Spine rigs were found in this folder. Check that it is the game's *_Data folder "
-                "or a Unity project. The log shows which files were read."
-            )
-        else:
-            self._status.setText(f"{result['count']} rigs loaded. Nothing was written to disk.")
-        if errors:
-            self._status.setText(
-                f"{result['count']} rigs loaded, but {len(errors)} files had errors. See the log for details."
-            )
-            QMessageBox.warning(self, "Some files could not be loaded", "\n".join(errors[:20]))
-
-    def _on_failed(self, message: str) -> None:
-        self._finish_loading()
-        self._status.setText(message)
-        QMessageBox.critical(self, "Could not load this folder", message)
-
-    def _finish_loading(self) -> None:
-        self._progress.setVisible(False)
-        self._choose.setEnabled(True)
-
-    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
-        if self._viewer is not None:
-            self._viewer.stop()
-        if self._loader is not None:
-            self._loader.wait()
-        super().closeEvent(event)
-
-
-# Software rendering avoids the OpenGL setup that failed on some machines
-# ("Could not initialize GLX", then SIGABRT). Users can override either setting
-# by exporting the variable before starting the app.
-_RENDERING_DEFAULTS = {
-    "QT_OPENGL": "software",
-    # SwiftShader keeps WebGL working in software; --disable-gpu would turn WebGL off
-    # and spine-player would refuse to start.
-    "QTWEBENGINE_CHROMIUM_FLAGS": "--use-angle=swiftshader --enable-unsafe-swiftshader",
-}
-
-
-def _apply_rendering_defaults() -> None:
-    for name, value in _RENDERING_DEFAULTS.items():
-        if name in os.environ:
-            logger.info("%s is already set to %r; leaving it alone", name, os.environ[name])
-        else:
-            os.environ[name] = value
-            logger.info("%s set to %r for stable rendering", name, value)
+    def _call(self, name: str, *args: object) -> None:
+        arguments = ", ".join(json.dumps(arg) for arg in args)
+        self._window.evaluate_js(f"{name}({arguments})")
 
 
 def run(initial: Path | None = None) -> int:
     configure_logging()
-    _apply_rendering_defaults()
     logger.info("starting window (python %s, platform %s)", sys.version.split()[0], sys.platform)
-    app = QApplication([sys.argv[0]])
-    window = MainWindow(initial)
-    window.show()
-    return app.exec()
+    server = start_viewer({"index.html": _launcher_html()})
+    launcher = Launcher(server, _launcher_html())
+    window = webview.create_window("Laminectomy", url=server.url, js_api=launcher, width=1200, height=820)
+    launcher.attach(window)
+
+    def on_started() -> None:
+        if initial is not None:
+            window.events.loaded.wait()
+            launcher.start_load(str(initial))
+
+    try:
+        webview.start(on_started)
+    except WebViewException:
+        logger.exception("pywebview could not start a window (platform %s)", sys.platform)
+        if sys.platform.startswith("linux"):
+            print(_LINUX_BACKEND_HELP, file=sys.stderr)
+        return 1
+    finally:
+        logger.info("window closed; stopping the viewer server")
+        server.stop()
+    return 0

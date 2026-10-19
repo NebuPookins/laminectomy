@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> None:
     if args and args[0] in _COMMANDS | {"-h", "--help"}:
         _cli(args)
         return
-    # Imported here so the command line works without Qt installed.
+    # Imported here so the command line works without a GUI toolkit installed.
     from .gui import run
 
     initial = Path(args[0]) if args else None
