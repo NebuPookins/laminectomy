@@ -18,6 +18,36 @@ _OS_NAMES = {"Linux": "linux", "Windows": "windows", "Darwin": "macos"}
 _ARCH_NAMES = {"amd64": "x86_64", "x86_64": "x86_64", "arm64": "arm64", "aarch64": "arm64"}
 
 
+# Qt modules the app never imports. Excluding them shrinks the bundle without touching the
+# web engine the viewer needs. Add a module here only after confirming the app still runs.
+UNUSED_QT_MODULES = [
+    "PySide6.QtQuick",
+    "PySide6.QtQuick3D",
+    "PySide6.QtQuickWidgets",
+    "PySide6.QtQml",
+    "PySide6.QtDesigner",
+    "PySide6.QtPdf",
+    "PySide6.QtPdfWidgets",
+    "PySide6.Qt3DCore",
+    "PySide6.Qt3DRender",
+    "PySide6.QtGraphs",
+    "PySide6.QtMultimedia",
+    "PySide6.QtSpatialAudio",
+    "PySide6.QtCharts",
+    "PySide6.QtDataVisualization",
+    "PySide6.QtSql",
+    "PySide6.QtTest",
+    "PySide6.QtBluetooth",
+    "PySide6.QtNfc",
+    "PySide6.QtPositioning",
+    "PySide6.QtSensors",
+    "PySide6.QtSerialPort",
+    "PySide6.QtSerialBus",
+    "PySide6.QtTextToSpeech",
+    "PySide6.QtWebSockets",
+]
+
+
 def platform_tag() -> str:
     system = _OS_NAMES[platform.system()]
     arch = _ARCH_NAMES[platform.machine().lower()]
@@ -54,6 +84,7 @@ def main() -> None:
             # astc_encoder imports archspec at load time and needs its CPU database files.
             "--collect-all",
             "archspec",
+            *[item for module in UNUSED_QT_MODULES for item in ("--exclude-module", module)],
             "--distpath",
             str(ROOT / "dist"),
             "--workpath",
