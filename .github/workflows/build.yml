@@ -1,0 +1,98 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release run at a time, so two quick pushes can't race on the nightly release.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ubuntu-22.04 keeps the Linux binary runnable on older glibc versions.
+        os: [ubuntu-22.04, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]" pyinstaller
+
+      - name: Test
+        shell: bash
+        run: python -m pytest -q
+
+      - name: Build executable
+        shell: bash
+        run: python scripts/build_binary.py
+
+      - name: Smoke test
+        shell: bash
+        run: bash scripts/smoke_test.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: laminectomy-${{ matrix.os }}
+          path: dist/laminectomy-*
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List files
+        shell: bash
+        run: ls -la dist
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            Executables are not code-signed.
+            - macOS: the first launch is blocked. Right-click the file and choose Open, or run `xattr -d com.apple.quarantine <file>`.
+            - Windows: SmartScreen shows a warning. Choose "More info", then "Run anyway".
+
+      - name: Update rolling nightly
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Replace the previous nightly release and its tag with this build.
+          gh release delete nightly --cleanup-tag --yes || true
+          gh release create nightly dist/* \
+            --target "$GITHUB_SHA" \
+            --prerelease \
+            --title "Nightly build ($(date -u +%F))" \
+            --notes "Built from commit $GITHUB_SHA. Unsigned: macOS blocks the first launch (right-click, Open), and Windows SmartScreen warns (More info, Run anyway)."
