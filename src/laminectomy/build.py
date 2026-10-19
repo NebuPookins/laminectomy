@@ -93,6 +93,7 @@ def load_source(source: Source, workers: int | None = None, progress: Progress |
     worker, jobs = _jobs(source)
     logger.info("loading %s folder %s: %d input files", source.mode, source.root, len(jobs))
     if not jobs:
+        logger.warning("no input files to read under %s", source.root)
         return Loaded((), ())
     rigs: list[Rig] = []
     errors: list[str] = []
@@ -116,6 +117,8 @@ def load_source(source: Source, workers: int | None = None, progress: Progress |
                 progress(done, len(futures))
     ordered = _unique_keys(sorted(rigs, key=lambda r: (r.group, r.source, r.name)))
     logger.info("loaded %d rigs (%d viewable) with %d errors", len(ordered), sum(r.viewable for r in ordered), len(errors))
+    if not any(r.viewable for r in ordered):
+        logger.warning("no viewable Spine rigs found under %s", source.root)
     for message in errors:
         logger.error("%s", message)
     return Loaded(ordered, tuple(errors))

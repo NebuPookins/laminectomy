@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -128,7 +129,14 @@ class MainWindow(QMainWindow):
         self._web.setVisible(True)
         self._finish_loading()
         errors = result["errors"]
-        self._status.setText(f"{result['count']} rigs loaded. Nothing was written to disk.")
+        if result["count"] == 0:
+            logger.warning("no viewable Spine rigs found in %s", self._path_label.text())
+            self._status.setText(
+                "No Spine rigs were found in this folder. Check that it is the game's *_Data folder "
+                "or a Unity project. The log shows which files were read."
+            )
+        else:
+            self._status.setText(f"{result['count']} rigs loaded. Nothing was written to disk.")
         if errors:
             self._status.setText(
                 f"{result['count']} rigs loaded, but {len(errors)} files had errors. See the log for details."
@@ -152,8 +160,30 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
 
+# Software rendering avoids the OpenGL setup that failed on some machines
+# ("Could not initialize GLX", then SIGABRT). Users can override either setting
+# by exporting the variable before starting the app.
+_RENDERING_DEFAULTS = {
+    "QT_OPENGL": "software",
+    # SwiftShader keeps WebGL working in software; --disable-gpu would turn WebGL off
+    # and spine-player would refuse to start.
+    "QTWEBENGINE_CHROMIUM_FLAGS": "--use-angle=swiftshader --enable-unsafe-swiftshader",
+}
+
+
+def _apply_rendering_defaults() -> None:
+    for name, value in _RENDERING_DEFAULTS.items():
+        if name in os.environ:
+            logger.info("%s is already set to %r; leaving it alone", name, os.environ[name])
+        else:
+            os.environ[name] = value
+            logger.info("%s set to %r for stable rendering", name, value)
+
+
 def run(initial: Path | None = None) -> int:
     configure_logging()
+    _apply_rendering_defaults()
+    logger.info("starting window (python %s, platform %s)", sys.version.split()[0], sys.platform)
     app = QApplication([sys.argv[0]])
     window = MainWindow(initial)
     window.show()
